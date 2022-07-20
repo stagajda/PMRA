@@ -1,0 +1,374 @@
+---
+title: "mixed_effects_tests"
+author: "Stanislaw Gajda"
+date: "12 01 2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+library(ggplot2)
+library(GGally)
+library(reshape2)
+library(lme4)
+library(compiler)
+library(parallel)
+library(boot)
+library(lattice)
+library(data.table)
+library(car)
+```
+Players_results - input table with cross-valdiation results. It contains 3 columns: player, round, score
+```{r cars}
+#data from data_preparation.rmd
+players_results = credit_results_final
+head(players_results)
+```
+
+Loading source code provided by A.Gosiewska and P.Biecek (ref: ???)
+```{r}
+getwd()
+source("calculate_elo.R")
+```
+
+
+```{r}
+players_results <- players_results[order(players_results[["player"]], players_results[["round"]]),]
+players_results[, "player"] <- factor(players_results[["player"]])
+model_matrix_list <- list()
+
+all_models_names <- unique(players_results$player)
+for (i in (0:10)){
+  round_i_results = players_results[players_results$round == i,]
+  actual_score_i <- calculate_actual_wins(round_i_results, compare_in_round = TRUE, decreasing_metric = TRUE)
+  model_matrix_i <- prepare_model_matrix(actual_score_i)
+  model_matrix_i <- as.data.frame(model_matrix_i)
+  model_matrix_i$round <- rep(i,times = dim(model_matrix_i)[1])
+  model_matrix_i$loses <- actual_score_i$loses
+  model_matrix_i$wins <- actual_score_i$wins
+  ncols = dim(model_matrix_i)[2]
+  colnames(model_matrix_i)[c(ncols-2,ncols-1,ncols)] = c('round', 'loses', 'wins')
+  model_matrix_list[[i+1]] <- model_matrix_i
+}
+dim(model_matrix_list[[1]])
+full_model_matrix <- model_matrix_list[[1]]
+
+for(i in 2:10){
+  full_model_matrix <- rbind(full_model_matrix, model_matrix_list[[i]])
+}
+head(full_model_matrix)
+```
+
+Transformation to single notation (Removes half of rows)
+May be optimized
+```{r}
+drop_double_observations <- function(model_matrix){
+  print(dim(model_matrix))
+  keep = c()
+  for(row in rownames(model_matrix)){
+    col = 1
+    while(col <= dim(model_matrix)[2]){
+      if(model_matrix[row,col] == 1){
+        keep <- append(keep, row)
+        break
+      }
+      else if(model_matrix[row,col] == -1){
+        break
+      }
+    col <- col+1
+    }
+  }
+  keep 
+}
+
+full_model_matrix_single <- drop_double_observations(full_model_matrix)
+full_model_matrix_single <- full_model_matrix[full_model_matrix_single,]
+models_num <- length(colnames(full_model_matrix_single))-3
+full_model_matrix_single["wins"] <- sapply(full_model_matrix_single["wins"], as.integer)
+print(head(full_model_matrix_single))
+```
+
+
+
+Mixed effects model - initial estimation. Model with lowest coefficient is chosen as zero model. Then another estimation
+```{r}
+model_zero <- colnames(full_model_matrix_single)[1]
+me_model_full <- glmer(as.formula(paste("wins ~ . -round -loses -", model_zero, "+ (1 | round)"))  
+            , data = full_model_matrix_single, family = binomial, control = glmerControl(optimizer = "bobyqa"),
+           nAGQ = 10)
+min_beta = min(summary(me_model_full)$coeff[2:models_num,1])
+model_zero <- names(which(summary(me_model_full)$coeff[2:models_num,1] == min_beta))
+me_model_full <- glmer(as.formula(paste("wins ~ . -round -loses -", model_zero, "+ (1 | round)"))  
+            , data = full_model_matrix_single, family = binomial, control = glmerControl(optimizer = "bobyqa"),
+           nAGQ = 10)
+```
+
+
+
+Elimination of insignificant fixed effects.
+
+Rigorous backward approach:
+```{r}
+# m_actual <- me_model_full
+# m_actual_formula <- paste("wins ~ . -round -loses -", model_zero)
+# m_actual_formula2 <- "+ (1 | round)"
+# models_num_act <- models_num
+# finished <- FALSE
+# while(finished == FALSE){
+#   finished <- TRUE
+#   pvalues <- summary(m_actual)$coeff[2:(models_num_act),4]
+#   pvalues_sorted <- sort(pvalues, decreasing = TRUE) 
+#   for (i in 1:length(pvalues_sorted)){
+#     print(i)
+#     #probujemy usuniecia danej zmiennej
+#     m_restricted_formula <- paste(m_actual_formula, "-", names(pvalues_sorted)[i], m_actual_formula2)
+#     print(m_restricted_formula)
+#     m_restricted <- glmer(as.formula(m_restricted_formula)  
+#             , data = full_model_matrix_single, family = binomial, control = glmerControl(optimizer = "bobyqa"),
+#            nAGQ = 10)
+#     anova_comp <- anova(me_model_full, m_restricted)
+#     if(anova_comp$`Pr(>Chisq)`[2]>0.05){
+#       #modele nie roznia sie istotnie, usuwamy te zmienna
+#       m_actual <- m_restricted
+#       m_actual_formula <- paste(m_actual_formula, " -",names(pvalues_sorted)[i])
+#       print("usunelismy:")
+#       print(names(pvalues_sorted)[i])
+#       finished <- FALSE
+#       models_num_act <- models_num_act - 1
+#       break
+#     }
+#   }
+# }
+# 
+# summary(m_actual)
+# ranef(m_actual)
+```
+
+Accelerated backward approach:
+```{r}
+granica_alg_2 = 0.001
+m_actual <- me_model_full
+m_actual_formula <- paste("wins ~ . -round -loses -", model_zero)
+m_actual_formula2 <- "+ (1 | round)"
+models_num_act <- models_num
+finished <- FALSE
+while(finished == FALSE){
+  pvalues <- summary(m_actual)$coeff[2:(models_num_act),4]
+  pvalues_sorted <- sort(pvalues, decreasing = TRUE)
+
+  for (i in 1:length(pvalues_sorted)){
+    if(pvalues_sorted[i] < granica_alg_2){
+      finished = TRUE
+      break;
+    }
+    m_restricted_formula <- paste(m_actual_formula, "-", names(pvalues_sorted)[i], m_actual_formula2)
+    m_restricted <- glmer(as.formula(m_restricted_formula)  
+              , data = full_model_matrix_single, family = binomial, control = glmerControl(optimizer = "bobyqa"),
+             nAGQ = 10)
+    anova_comp <- anova(me_model_full, m_restricted)
+    if(anova_comp$`Pr(>Chisq)`[2]>0.05){
+        m_actual <- m_restricted
+        m_actual_formula <- paste(m_actual_formula, " -",names(pvalues_sorted)[i])
+        print("usunelismy:")
+        print(names(pvalues_sorted)[i])
+        finished <- FALSE
+        models_num_act <- models_num_act - 1
+        break
+    }
+  }
+}
+
+```
+
+
+Eliminated models
+```{r}
+formula_act <- formula(m_actual)
+dl <- nchar(as.character(formula_act[3]))
+eliminated <- substr(as.character(formula_act[3]),21,dl-14)
+eliminated2 <- strsplit(eliminated, " - ")
+eliminated <- eliminated2[[1]]
+print(eliminated)
+```
+
+Probability matrix
+```{r}
+model_zero_indexes = c()
+for (i in (1:length(eliminated))){
+  ind = which(colnames(full_model_matrix_single) == eliminated[i])
+  model_zero_indexes <- append(model_zero_indexes, ind)
+}
+ktory = 2
+betas <- c()
+for(i in 1:models_num){
+  if(i %in% model_zero_indexes){
+    betas[i] <- 0
+  }
+  else{
+    betas[i] <- fixef(m_actual)[ktory]
+    ktory <- ktory + 1
+  }
+}
+
+intercept <- fixef(m_actual)[1]
+names(betas) <- colnames(full_model_matrix_single)[1:models_num]
+
+prob_matrix <- matrix(1:(models_num*models_num), nrow = models_num)
+colnames(prob_matrix) <-  names(betas)
+rownames(prob_matrix) <- names(betas)
+
+#probability that ith player wins against j (j>i)
+winning_prob <- function(beta0, betai, betaj){
+  wynik <- (1/(1+exp(-beta0 - betai + betaj)))
+  names(wynik) <- NULL
+  wynik
+}
+
+
+test_for_equality_wald <- function(name1, name2){
+  if(name1 == name2){
+    1
+  }
+  else{
+    #zmieniamy kolejnosc tak, zeby name1 to byl ten, ktory ma wczesniejszy indeks
+    if(which(names(betas) == name1) > which(names(betas) == name2)){
+      temp = name1
+      name1 = name2
+      name2 = temp
+    }
+    if(name1 %in% eliminated){
+        LH <- linearHypothesis(m_actual, c(paste("(Intercept)-", name2, "= 0")))
+    }
+    if(name2 %in% eliminated){
+        LH <- linearHypothesis(m_actual, c(paste(name1, "+(Intercept)", "= 0")))
+    }
+    if((!name1 %in% eliminated) & (!name2 %in% eliminated)){
+        LH <- linearHypothesis(m_actual, c(paste(name1, "+(Intercept)-",name2, "= 0"))) 
+    }
+    LH$`Pr(>Chisq)`[2]  
+  }
+}
+
+for (i in 1:models_num-1){
+  for(j in (i+1):models_num){
+    prob_matrix[i,j] = winning_prob(intercept, betas[i], betas[j])
+    prob_matrix[j,i] = 1 - prob_matrix[i,j]
+  }
+}
+for (i in 1:models_num){
+  prob_matrix[i,i] = 1/2
+}
+```
+
+PMRA ranking creation
+```{r}
+choose_the_best <- function(p_matrix){
+    if(dim(p_matrix)[1] == 2){
+      if(p_matrix[1,2] > 0.5){
+        best_model <- colnames(p_matrix)
+      }
+      else{
+        best_model <- rev(colnames(p_matrix))
+      }
+    }
+    else{
+      win_num <- rowSums(p_matrix >= 0.5)
+      best_win_num = max(win_num)
+      best_model <- colnames(p_matrix)[which(win_num == best_win_num)]
+    }
+  best_model
+}
+calculate_order <- function(p_matrix){
+  order_names <- c()
+  order_index <- c()
+  best <- choose_the_best(p_matrix)
+  order_names <- c(order_names, best)
+  which_beta <- function(x){
+    which(names(betas) == x)
+  }
+  order_index <- unlist(lapply(order_names, which_beta))
+      
+  while(TRUE){
+      best <- choose_the_best(p_matrix[-order_index,-order_index])
+      order_names <- c(order_names, best)
+      order_index <- unlist(lapply(order_names, which_beta))
+    
+    if(length(order_names) == models_num){
+      break
+    }
+  }
+  order_names
+}
+
+order_pbrm <- calculate_order(prob_matrix)
+
+
+```
+
+
+AUC ranking creation
+```{r}
+
+library(dplyr)
+
+d_grp = players_results %>% group_by(player)  %>%
+                    summarise(avg_auc = mean(score),
+                              .groups = 'drop')
+order_auc <- d_grp[order(d_grp$avg_auc),]
+
+```
+
+```{r}
+order_auc <- data.frame(order_auc)
+order_auc <- order_auc[length(betas):1,]
+```
+
+
+Comparision of both rankings
+```{r}
+comp <- data.frame(auc = order_auc$player, pbrm = order_pbrm)
+comp[,]
+```
+ANALIZA MEAN AUC vs PBRM
+
+
+Comparision of RF2 and XGB5 results
+```{r}
+rf2_score <- players_results[players_results$player == "RF2",c("score", "player")]
+rf2_score$fold <- 1:10
+xgb5_score <- players_results[players_results$player == "XGB5",c("score","player")]
+xgb5_score$fold <- 1:10
+full_comp <- rbind(rf2_score, xgb5_score)
+colnames(full_comp)[1] <- "AUC_score"
+ggplot(full_comp, aes(x = AUC_score, y = fold, color = player)) + geom_point(size = 5) + scale_y_discrete(limits=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10")) + labs(color = "Model") +xlab("AUC") + ylab("Fold")
+
+mean_rf2 = mean(rf2_score$score)
+mean_xgb5 = mean(xgb5_score$score)
+```
+
+Quantile performance comparision for RF2 and XGB5
+```{r}
+full_comp$quantile = c()
+for(i in 1:length(full_comp$AUC_score)){
+  print(i)
+  quantile_fun <- ecdf(players_results[players_results$round == full_comp[i,]$fold-1,"score"])
+  full_comp$quantile[i] = quantile_fun(full_comp$AUC_score[i])
+}
+ggplot(full_comp, aes(x = quantile, y = fold, color = player)) + geom_point(size = 5) + scale_y_discrete(limits=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10")) + xlab("Quantile") + ylab("Fold") + labs(color = "Model")
+
+```
+
+
+Probability of win of RF2 against XGB5 and test for significance of performance difference
+```{r}
+print(winning_prob(intercept, betas["RF2"], betas["XGB5"]))
+LH <- linearHypothesis(m_actual, c("RF2+(Intercept)-XGB5=0"))
+print(LH)
+
+```
+
+
+
+
+
